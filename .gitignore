@@ -1,0 +1,43 @@
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# PyTorch
+*.pth
+*.pt
+kokoro-v1_0.pth
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Audio output files (optional - remove if you want to track them)
+*.wav
+optimized_output.wav
+
+# Temporary files
+*.tmp
+*.temp 

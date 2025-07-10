@@ -21,7 +21,7 @@ def split_text(text, max_sentences=2):
 def generate_audio(kokoro, chunk, filename):
     """Generate audio for a chunk and save to file"""
     print(f"🔄 Generating: {chunk[:50]}...")
-    audio_segments = list(kokoro(chunk, voice="af_sarah", speed=1.2))
+    audio_segments = list(kokoro(chunk, voice="am_adam", speed=1.2))
     
     # Concatenate all audio segments 
     full_audio = torch.cat([torch.tensor(audio) for _, _, audio in audio_segments])

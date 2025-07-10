@@ -41,3 +41,6 @@ optimized_output.wav
 # Temporary files
 *.tmp
 *.temp 
+
+# Test files
+benny.txt

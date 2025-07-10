@@ -1,11 +1,3 @@
-"""
-pip install -U kokoro-onnx soundfile
-
-wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v0_19.onnx
-wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.json
-python examples/save.py
-"""
-
 import soundfile as sf
 from kokoro import KPipeline
 import subprocess
@@ -82,7 +74,7 @@ def cleanup_files(filenames):
 
 kokoro = KPipeline('a')  # 'a' for American English
 
-with open("test.txt", "r") as file:
+with open("benny.txt", "r") as file:
     text = file.read()
 
 chunks = split_text(text)

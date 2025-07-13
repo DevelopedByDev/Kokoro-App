@@ -1,9 +1,0 @@
-Hello, this is a test of the Kokoro text-to-speech system running on Apple Silicon. The optimization script we created earlier showed impressive performance results. This should generate multiple audio chunks and play them back seamlessly. Apple's Neural Engine provides excellent acceleration for machine learning workloads. 
-
-In a bustling coastal village nestled between emerald hills and the relentless sea, young Lila discovered an ancient, weathered map hidden in her grandmother's attic. The parchment, faded with age, promised treasures lost to time. Eager and wide-eyed, Lila shared it with her best friend, Tomas, a quiet boy with a knack for adventure.
-
-That evening, under a sky painted with stars, they set out by lantern light. The map led them through whispering forests and across rocky shores, where waves crashed like forgotten lullabies. Danger lurked—a sudden storm brewed, winds howling secrets of the deep. Undeterred, they pressed on, their friendship a beacon against the dark.
-
-At last, they uncovered a chest buried in the sand, filled not with gold, but with letters from long-lost sailors. Each note spoke of dreams and distant lands, reminding Lila that true treasure lies in stories shared.
-
-As dawn broke, Lila and Tomas returned home, hearts full. The map, now a shared keepsake, taught them that every journey weaves its own tale

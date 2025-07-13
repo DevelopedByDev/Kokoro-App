@@ -5,6 +5,7 @@ coremltools
 onnx
 pynput
 pyperclip
+psutil
 # New dependencies for GUI
 PyPDF2
 ebooklib

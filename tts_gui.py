@@ -10,6 +10,13 @@ import torch
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import json
+import asyncio
+import platform
+import psutil
+from threading import Event
+import queue
+from collections import deque
+import tempfile
 
 # File format imports
 import PyPDF2
@@ -23,24 +30,44 @@ from kokoro import KPipeline
 class TTSApplication:
     def __init__(self, root):
         self.root = root
-        self.root.title("Kokoro TTS Reader")
-        self.root.geometry("800x600")
+        self.root.title("🎙️ Kokoro TTS Reader")
+        self.root.geometry("1000x700")
+        self.root.minsize(900, 650)
+        
+        # M1 Pro optimizations
+        self.setup_m1_optimizations()
         
         # Initialize variables
         self.text_content = ""
         self.chunks = []
-        self.current_batch = 0
-        self.total_batches = 0
+        self.current_chunk_index = 0
+        self.total_chunks = 0
         self.is_playing = False
         self.is_paused = False
         self.current_process = None
-        self.current_batch_file = None
         self.tts_thread = None
         self.kokoro = None
         self.batch_dir = "batches_and_chunks"
         
+        # Streaming audio system
+        self.audio_buffer = deque(maxlen=20)  # Buffer for generated audio files
+        self.playback_queue = queue.Queue()
+        self.generation_queue = queue.Queue()
+        self.stop_event = Event()
+        self.playback_thread = None
+        self.generation_workers = []
+        
+        # Buffer management
+        self.buffer_size = 8  # Number of chunks to keep in buffer
+        self.min_buffer_size = 3  # Minimum chunks before starting playback
+        self.generation_ahead = 12  # Generate this many chunks ahead
+        
         # Initialize status variable first
-        self.status_var = tk.StringVar(value="Initializing...")
+        self.status_var = tk.StringVar(value="🚀 Initializing...")
+        self.progress_text_var = tk.StringVar(value="Ready to load a file")
+        
+        # Setup modern UI theme
+        self.setup_modern_theme()
         
         # Setup UI
         self.setup_ui()
@@ -51,14 +78,215 @@ class TTSApplication:
         # Setup batch directory
         self.setup_batches_directory()
         
+        # Start streaming workers
+        self.start_streaming_workers()
+        
+    def setup_m1_optimizations(self):
+        """Setup M1 Pro specific optimizations"""
+        self.cpu_count = psutil.cpu_count(logical=False)  # Physical cores
+        self.max_workers = min(8, self.cpu_count)  # M1 Pro has 8 performance cores
+        
+        # Enable MPS if available and properly supported
+        try:
+            if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+                self.device = torch.device("mps")
+                print("🚀 MPS (Metal Performance Shaders) enabled")
+            else:
+                self.device = torch.device("cpu")
+                print("⚠️ MPS not available, using CPU")
+        except (AttributeError, ImportError) as e:
+            print(f"⚠️ MPS support error: {e}")
+            self.device = torch.device("cpu")
+            
+        # Optimize generation parameters
+        self.generation_batch_size = 8 if self.device.type == "mps" else 4
+        
+    def setup_modern_theme(self):
+        """Setup modern dark theme"""
+        style = ttk.Style()
+        
+        # Configure modern theme
+        style.theme_use('clam')
+        
+        # Color scheme
+        self.colors = {
+            'bg': '#1e1e1e',
+            'fg': '#ffffff',
+            'select_bg': '#404040',
+            'select_fg': '#ffffff',
+            'button_bg': '#0d7377',
+            'button_fg': '#ffffff',
+            'accent': '#14a085',
+            'warning': '#f39c12',
+            'error': '#e74c3c',
+            'success': '#27ae60',
+            'text_bg': '#2d2d2d',
+            'frame_bg': '#252525'
+        }
+        
+        # Configure styles
+        style.configure('Modern.TFrame', background=self.colors['bg'])
+        style.configure('Modern.TLabel', background=self.colors['bg'], foreground=self.colors['fg'])
+        style.configure('Modern.TButton', background=self.colors['button_bg'], foreground=self.colors['button_fg'])
+        style.configure('Modern.TEntry', fieldbackground=self.colors['text_bg'], foreground=self.colors['fg'])
+        style.configure('Modern.TCombobox', fieldbackground=self.colors['text_bg'], foreground=self.colors['fg'])
+        style.configure('Modern.TSpinbox', fieldbackground=self.colors['text_bg'], foreground=self.colors['fg'])
+        style.configure('Modern.TLabelframe', background=self.colors['frame_bg'], foreground=self.colors['fg'])
+        style.configure('Modern.TLabelframe.Label', background=self.colors['frame_bg'], foreground=self.colors['fg'])
+        style.configure('Modern.TProgressbar', background=self.colors['accent'])
+        style.layout('Modern.TProgressbar',
+                    [('Horizontal.Progressbar.trough',
+                      {'children': [('Horizontal.Progressbar.pbar',
+                                   {'side': 'left', 'sticky': 'ns'})],
+                       'sticky': 'nswe'})])
+        
+        # Configure root window
+        self.root.configure(bg=self.colors['bg'])
+        
+    def start_streaming_workers(self):
+        """Start streaming audio generation and playback workers"""
+        # Start generation workers
+        for i in range(self.max_workers):
+            worker = threading.Thread(target=self.streaming_generation_worker, daemon=True)
+            worker.start()
+            self.generation_workers.append(worker)
+            
+        # Start playback manager
+        self.playback_thread = threading.Thread(target=self.streaming_playback_manager, daemon=True)
+        self.playback_thread.start()
+        
+    def streaming_generation_worker(self):
+        """Worker thread for continuous audio generation"""
+        while not self.stop_event.is_set():
+            try:
+                task = self.generation_queue.get(timeout=1)
+                if task is None:
+                    break
+                    
+                chunk_index, chunk_text = task
+                
+                # Generate unique filename
+                filename = os.path.join(self.batch_dir, f"stream_chunk_{chunk_index}_{int(time.time() * 1000)}.wav")
+                
+                # Generate audio with device optimization
+                with torch.no_grad():
+                    try:
+                        audio_segments = list(self.kokoro(chunk_text, voice=self.voice_var.get(), speed=self.speed_var.get()))
+                        
+                        # Process audio tensors with proper error handling
+                        if self.device.type == "mps":
+                            try:
+                                full_audio = torch.cat([audio.detach().clone().to(self.device) for _, _, audio in audio_segments])
+                                samples = full_audio.cpu().numpy()
+                            except RuntimeError as e:
+                                print(f"⚠️ MPS processing error, falling back to CPU: {e}")
+                                full_audio = torch.cat([audio.detach().clone() for _, _, audio in audio_segments])
+                                samples = full_audio.numpy()
+                        else:
+                            full_audio = torch.cat([audio.detach().clone() for _, _, audio in audio_segments])
+                            samples = full_audio.numpy()
+                            
+                        # Save audio file
+                        sf.write(filename, samples, 24000, format="WAV")
+                        
+                        # Add to playback queue
+                        self.playback_queue.put((chunk_index, filename))
+                        
+                        # Update progress
+                        progress = (chunk_index + 1) / self.total_chunks * 100
+                        self.root.after(0, lambda p=progress: self.progress_var.set(p))
+                        
+                    except Exception as e:
+                        print(f"❌ Audio generation error for chunk {chunk_index}: {e}")
+                        
+                self.generation_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"❌ Generation worker error: {e}")
+                
+    def streaming_playback_manager(self):
+        """Manager for continuous audio playback"""
+        playback_buffer = {}  # chunk_index -> filename
+        next_chunk_to_play = 0
+        current_playback_process = None
+        
+        while not self.stop_event.is_set():
+            try:
+                # Get generated audio files
+                try:
+                    chunk_index, filename = self.playback_queue.get(timeout=0.1)
+                    playback_buffer[chunk_index] = filename
+                except queue.Empty:
+                    pass
+                
+                # Check if we can start/continue playback
+                if (self.is_playing and not self.is_paused and 
+                    next_chunk_to_play in playback_buffer and
+                    (current_playback_process is None or current_playback_process.poll() is not None)):
+                    
+                    # Start playing next chunk
+                    filename = playback_buffer[next_chunk_to_play]
+                    
+                    # Update status
+                    self.root.after(0, lambda idx=next_chunk_to_play: 
+                                   self.status_var.set(f"🎵 Playing chunk {idx + 1}/{self.total_chunks}"))
+                    
+                    # Start playback
+                    current_playback_process = subprocess.Popen(['afplay', filename])
+                    
+                    # Clean up old file and move to next
+                    if next_chunk_to_play > 0:
+                        old_filename = playback_buffer.get(next_chunk_to_play - 1)
+                        if old_filename and os.path.exists(old_filename):
+                            try:
+                                os.remove(old_filename)
+                            except:
+                                pass
+                    
+                    del playback_buffer[next_chunk_to_play]
+                    next_chunk_to_play += 1
+                    
+                    # Check if we've finished all chunks
+                    if next_chunk_to_play >= self.total_chunks:
+                        # Wait for last chunk to finish
+                        if current_playback_process:
+                            current_playback_process.wait()
+                        self.root.after(0, self.reading_completed)
+                        break
+                
+                # Handle pause/stop
+                if not self.is_playing and current_playback_process and current_playback_process.poll() is None:
+                    current_playback_process.terminate()
+                    current_playback_process = None
+                    
+                time.sleep(0.05)  # Small delay to prevent excessive CPU usage
+                
+            except Exception as e:
+                print(f"❌ Playback manager error: {e}")
+                time.sleep(0.1)
+                
+        # Cleanup on exit
+        if current_playback_process and current_playback_process.poll() is None:
+            current_playback_process.terminate()
+            
+        # Clean up remaining files
+        for filename in playback_buffer.values():
+            if os.path.exists(filename):
+                try:
+                    os.remove(filename)
+                except:
+                    pass
+    
     def setup_tts(self):
         """Initialize the Kokoro TTS pipeline"""
         try:
             self.kokoro = KPipeline('a')  # American English
-            self.status_var.set("Ready")
+            self.status_var.set("✅ Ready")
         except Exception as e:
             messagebox.showerror("TTS Error", f"Failed to initialize TTS: {str(e)}")
-            self.status_var.set("TTS initialization failed")
+            self.status_var.set("❌ TTS initialization failed")
     
     def setup_batches_directory(self):
         """Create the batches_and_chunks directory if it doesn't exist"""
@@ -66,9 +294,9 @@ class TTSApplication:
             os.makedirs(self.batch_dir)
     
     def setup_ui(self):
-        """Setup the user interface"""
-        # Main frame
-        main_frame = ttk.Frame(self.root, padding="10")
+        """Setup the modern user interface"""
+        # Main container with modern styling
+        main_frame = ttk.Frame(self.root, style='Modern.TFrame', padding="20")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Configure grid weights
@@ -76,82 +304,143 @@ class TTSApplication:
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=1)
         
-        # File upload section
-        file_frame = ttk.LabelFrame(main_frame, text="File Upload", padding="10")
-        file_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        # Header section
+        header_frame = ttk.Frame(main_frame, style='Modern.TFrame')
+        header_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 20))
+        header_frame.columnconfigure(1, weight=1)
+        
+        # App title with icon
+        title_label = ttk.Label(header_frame, text="🎙️ Kokoro TTS Reader", 
+                               style='Modern.TLabel', font=('Helvetica', 24, 'bold'))
+        title_label.grid(row=0, column=0, sticky=tk.W)
+        
+        # System info
+        system_info = f"🚀 M1 Pro | {self.max_workers} workers | MPS: {'✅' if self.device.type == 'mps' else '❌'}"
+        info_label = ttk.Label(header_frame, text=system_info, 
+                              style='Modern.TLabel', font=('Helvetica', 10))
+        info_label.grid(row=0, column=1, sticky=tk.E)
+        
+        # File upload section with modern styling
+        file_frame = ttk.LabelFrame(main_frame, text="📁 File Upload", style='Modern.TLabelframe', padding="15")
+        file_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 15))
         file_frame.columnconfigure(1, weight=1)
         
-        ttk.Label(file_frame, text="Select file:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        # File selection with better layout
+        file_label = ttk.Label(file_frame, text="Select file:", style='Modern.TLabel', font=('Helvetica', 11))
+        file_label.grid(row=0, column=0, sticky=tk.W, padx=(0, 15))
         
         self.file_var = tk.StringVar()
-        self.file_entry = ttk.Entry(file_frame, textvariable=self.file_var, state="readonly")
-        self.file_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 10))
+        self.file_entry = ttk.Entry(file_frame, textvariable=self.file_var, state="readonly", 
+                                   style='Modern.TEntry', font=('Helvetica', 10))
+        self.file_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 15))
         
-        ttk.Button(file_frame, text="Browse", command=self.browse_file).grid(row=0, column=2)
+        browse_btn = ttk.Button(file_frame, text="📂 Browse", command=self.browse_file, 
+                               style='Modern.TButton', width=12)
+        browse_btn.grid(row=0, column=2)
         
-        # Text preview section
-        text_frame = ttk.LabelFrame(main_frame, text="Text Preview", padding="10")
-        text_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        # Text preview with better styling
+        text_frame = ttk.LabelFrame(main_frame, text="📖 Text Preview", style='Modern.TLabelframe', padding="15")
+        text_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 15))
         text_frame.columnconfigure(0, weight=1)
         text_frame.rowconfigure(0, weight=1)
         
-        self.text_preview = scrolledtext.ScrolledText(text_frame, height=15, wrap=tk.WORD)
+        # Custom text widget with dark theme
+        self.text_preview = scrolledtext.ScrolledText(
+            text_frame, 
+            height=12, 
+            wrap=tk.WORD,
+            bg=self.colors['text_bg'],
+            fg=self.colors['fg'],
+            insertbackground=self.colors['fg'],
+            selectbackground=self.colors['select_bg'],
+            selectforeground=self.colors['select_fg'],
+            font=('Helvetica', 11),
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=10,
+            pady=10
+        )
         self.text_preview.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # Control buttons section
-        control_frame = ttk.LabelFrame(main_frame, text="Audio Controls", padding="10")
-        control_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        # Control panel with modern layout
+        control_frame = ttk.LabelFrame(main_frame, text="🎛️ Audio Controls", style='Modern.TLabelframe', padding="15")
+        control_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 15))
+        control_frame.columnconfigure(4, weight=1)
         
-        # Voice selection
-        ttk.Label(control_frame, text="Voice:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        # Voice selection with better styling
+        voice_label = ttk.Label(control_frame, text="🎭 Voice:", style='Modern.TLabel', font=('Helvetica', 11))
+        voice_label.grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        
         self.voice_var = tk.StringVar(value="am_echo")
-        voice_combo = ttk.Combobox(control_frame, textvariable=self.voice_var, values=[
-            "am_echo", "am_adam", "am_eric", "am_liam", "am_michael", "am_onyx", "am_puck",
-            "af_heart", "af_jessica", "af_nova", "af_sarah", "af_sky", "af_bella"
-        ])
-        voice_combo.grid(row=0, column=1, sticky=tk.W, padx=(0, 20))
+        voice_combo = ttk.Combobox(control_frame, textvariable=self.voice_var, 
+                                  style='Modern.TCombobox', width=15, font=('Helvetica', 10),
+                                  values=[
+                                      "am_echo", "am_adam", "am_eric", "am_liam", "am_michael", "am_onyx", "am_puck",
+                                      "af_heart", "af_jessica", "af_nova", "af_sarah", "af_sky", "af_bella"
+                                  ])
+        voice_combo.grid(row=0, column=1, sticky=tk.W, padx=(0, 25))
         
-        # Speed selection
-        ttk.Label(control_frame, text="Speed:").grid(row=0, column=2, sticky=tk.W, padx=(0, 10))
+        # Speed control with better styling
+        speed_label = ttk.Label(control_frame, text="⚡ Speed:", style='Modern.TLabel', font=('Helvetica', 11))
+        speed_label.grid(row=0, column=2, sticky=tk.W, padx=(0, 10))
+        
         self.speed_var = tk.DoubleVar(value=1.1)
         speed_spin = ttk.Spinbox(control_frame, from_=0.5, to=2.0, increment=0.1, 
-                                textvariable=self.speed_var, width=10)
+                                textvariable=self.speed_var, width=8, style='Modern.TSpinbox',
+                                font=('Helvetica', 10))
         speed_spin.grid(row=0, column=3, sticky=tk.W)
         
-        # Control buttons
-        button_frame = ttk.Frame(control_frame)
-        button_frame.grid(row=1, column=0, columnspan=4, pady=(10, 0))
+        # Control buttons with modern styling
+        button_frame = ttk.Frame(control_frame, style='Modern.TFrame')
+        button_frame.grid(row=1, column=0, columnspan=5, pady=(20, 0))
         
-        self.start_btn = ttk.Button(button_frame, text="Start Reading", command=self.start_reading)
+        # Modern button styling
+        button_style = {'width': 12, 'style': 'Modern.TButton'}
+        
+        self.start_btn = ttk.Button(button_frame, text="▶️ Start", command=self.start_reading, **button_style)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 10))
         
-        self.pause_btn = ttk.Button(button_frame, text="Pause", command=self.pause_reading, state="disabled")
+        self.pause_btn = ttk.Button(button_frame, text="⏸️ Pause", command=self.pause_reading, 
+                                   state="disabled", **button_style)
         self.pause_btn.pack(side=tk.LEFT, padx=(0, 10))
         
-        self.resume_btn = ttk.Button(button_frame, text="Resume", command=self.resume_reading, state="disabled")
+        self.resume_btn = ttk.Button(button_frame, text="▶️ Resume", command=self.resume_reading, 
+                                    state="disabled", **button_style)
         self.resume_btn.pack(side=tk.LEFT, padx=(0, 10))
         
-        self.stop_btn = ttk.Button(button_frame, text="Stop", command=self.stop_reading, state="disabled")
+        self.stop_btn = ttk.Button(button_frame, text="⏹️ Stop", command=self.stop_reading, 
+                                  state="disabled", **button_style)
         self.stop_btn.pack(side=tk.LEFT)
         
-        # Progress section
-        progress_frame = ttk.LabelFrame(main_frame, text="Progress", padding="10")
-        progress_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        # Progress section with modern styling
+        progress_frame = ttk.LabelFrame(main_frame, text="📊 Progress", style='Modern.TLabelframe', padding="15")
+        progress_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 15))
         progress_frame.columnconfigure(0, weight=1)
         
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
-        self.progress_bar.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
+        # Progress bar
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, 
+                                          mode='determinate', style='Modern.TProgressbar')
+        self.progress_bar.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 8))
         
-        self.batch_info_var = tk.StringVar(value="No batches loaded")
-        ttk.Label(progress_frame, textvariable=self.batch_info_var).grid(row=1, column=0, sticky=tk.W)
+        # Progress text
+        self.batch_info_var = tk.StringVar(value="📄 No file loaded")
+        progress_label = ttk.Label(progress_frame, textvariable=self.batch_info_var, 
+                                  style='Modern.TLabel', font=('Helvetica', 10))
+        progress_label.grid(row=1, column=0, sticky=tk.W)
         
-        # Status bar
-        status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        status_bar.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
+        # Status bar with modern styling
+        status_frame = ttk.Frame(main_frame, style='Modern.TFrame')
+        status_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
+        status_frame.columnconfigure(0, weight=1)
+        
+        status_bar = ttk.Label(status_frame, textvariable=self.status_var, 
+                              style='Modern.TLabel', font=('Helvetica', 10, 'italic'),
+                              relief=tk.SUNKEN, anchor=tk.W, padding=(10, 5))
+        status_bar.grid(row=0, column=0, sticky=(tk.W, tk.E))
         
         # Configure grid weights for main frame
-        main_frame.rowconfigure(1, weight=1)
+        main_frame.rowconfigure(2, weight=1)
     
     def browse_file(self):
         """Open file dialog to select a file"""
@@ -186,111 +475,170 @@ class TTSApplication:
                 messagebox.showerror("Error", f"Unsupported file type: {file_ext}")
                 return
             
-            # Update text preview
-            self.text_preview.delete(1.0, tk.END)
-            self.text_preview.insert(1.0, self.text_content[:2000] + "..." if len(self.text_content) > 2000 else self.text_content)
-            
             # Prepare chunks
             self.chunks = self.split_text(self.text_content)
-            self.total_batches = len(self.chunks) // 4 + (1 if len(self.chunks) % 4 != 0 else 0)
+            self.total_chunks = len(self.chunks)
             
-            self.batch_info_var.set(f"Loaded {len(self.chunks)} chunks, {self.total_batches} batches")
-            self.status_var.set(f"File loaded: {Path(filename).name}")
+            self.batch_info_var.set(f"📄 {len(self.chunks)} chunks ready for streaming")
+            self.status_var.set(f"📁 File loaded: {Path(filename).name}")
+            
+            # Update UI
+            self.text_preview.delete(1.0, tk.END)
+            self.text_preview.insert(1.0, self.text_content[:2000] + "..." if len(self.text_content) > 2000 else self.text_content)
+            self.start_btn.config(state="normal")
+            self.progress_var.set(0)
+            
+            # Enable start button
+            self.start_btn.config(state="normal")
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load file: {str(e)}")
-            self.status_var.set("Failed to load file")
+            self.status_var.set("❌ Failed to load file")
     
     def read_txt_file(self, filename):
-        """Read text from a plain text file"""
+        """Read text from .txt file"""
         with open(filename, 'r', encoding='utf-8') as file:
             return file.read()
     
     def read_pdf_file(self, filename):
-        """Read text from a PDF file"""
+        """Read text from PDF file"""
         text = ""
         with open(filename, 'rb') as file:
             pdf_reader = PyPDF2.PdfReader(file)
             for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
+                text += page.extract_text()
         return text
     
     def read_epub_file(self, filename):
-        """Read text from an EPUB file"""
+        """Read text from EPUB file"""
         book = epub.read_epub(filename)
         text = ""
-        
         for item in book.get_items():
             if item.get_type() == ebooklib.ITEM_DOCUMENT:
-                soup = BeautifulSoup(item.get_body_content(), 'html.parser')
-                text += soup.get_text() + "\n"
-        
+                soup = BeautifulSoup(item.get_content(), 'html.parser')
+                text += soup.get_text()
         return text
     
     def split_text(self, text, max_sentences=2):
-        """Split text into chunks for TTS processing"""
-        sentences = text.split('. ')
+        """Split text into chunks for streaming processing"""
+        sentences = text.replace('\n', ' ').split('. ')
         chunks = []
-        for i in range(0, len(sentences), max_sentences):
-            chunk = '. '.join(sentences[i:i+max_sentences])
-            if not chunk.endswith('.'):
-                chunk += '.'
-            chunks.append(chunk)
+        current_chunk = ""
+        
+        for sentence in sentences:
+            if len(current_chunk) + len(sentence) < 300:  # Smaller chunks for streaming
+                current_chunk += sentence + ". "
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence + ". "
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
         return chunks
     
     def start_reading(self):
-        """Start the TTS reading process"""
+        """Start reading the text with streaming TTS"""
         if not self.text_content:
-            messagebox.showwarning("Warning", "Please load a file first")
+            messagebox.showwarning("No Text", "Please load a text file first!")
             return
         
         if not self.kokoro:
-            messagebox.showerror("Error", "TTS system not initialized")
+            messagebox.showerror("TTS Error", "TTS system not initialized!")
             return
         
+        # Reset streaming state
         self.is_playing = True
         self.is_paused = False
-        self.current_batch = 0
+        self.current_chunk_index = 0
+        self.stop_event.clear()
         
-        # Update button states
+        # Clear queues
+        while not self.generation_queue.empty():
+            try:
+                self.generation_queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        while not self.playback_queue.empty():
+            try:
+                self.playback_queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        # Update UI
         self.start_btn.config(state="disabled")
         self.pause_btn.config(state="normal")
         self.stop_btn.config(state="normal")
         
-        # Start TTS in a separate thread
-        self.tts_thread = threading.Thread(target=self.run_tts)
-        self.tts_thread.daemon = True
+        # Start streaming TTS in background thread
+        self.tts_thread = threading.Thread(target=self.run_streaming_tts, daemon=True)
         self.tts_thread.start()
+        
+        self.status_var.set("🚀 Starting streaming TTS...")
+        
+    def run_streaming_tts(self):
+        """Main streaming TTS processing method"""
+        try:
+            self.root.after(0, lambda: self.status_var.set("🔄 Queuing chunks for generation..."))
+            
+            # Queue all chunks for generation
+            for i, chunk in enumerate(self.chunks):
+                if not self.is_playing or self.stop_event.is_set():
+                    break
+                self.generation_queue.put((i, chunk))
+            
+            self.root.after(0, lambda: self.status_var.set("🎵 Streaming audio generation started..."))
+            
+            # The streaming workers will handle the rest automatically
+            # Just wait for completion or stop signal
+            while self.is_playing and not self.stop_event.is_set():
+                time.sleep(0.1)
+                
+        except Exception as e:
+            print(f"❌ Streaming TTS error: {e}")
+            self.root.after(0, lambda: messagebox.showerror("TTS Error", f"Streaming TTS failed: {str(e)}"))
+            self.root.after(0, self.stop_reading)
     
     def pause_reading(self):
-        """Pause the current audio playback"""
-        if self.current_process and self.is_playing:
+        """Pause audio playback"""
+        if self.is_playing and not self.is_paused:
             self.is_paused = True
-            self.current_process.terminate()
-            self.current_process = None
-            
             self.pause_btn.config(state="disabled")
             self.resume_btn.config(state="normal")
-            self.status_var.set("Paused")
-    
-    def resume_reading(self):
-        """Resume audio playback from current batch"""
-        if self.is_paused and self.current_batch_file:
-            self.is_paused = False
-            self.current_process = subprocess.Popen(['afplay', self.current_batch_file])
+            self.status_var.set("⏸️ Paused")
             
+    def resume_reading(self):
+        """Resume audio playback"""
+        if self.is_playing and self.is_paused:
+            self.is_paused = False
             self.pause_btn.config(state="normal")
             self.resume_btn.config(state="disabled")
-            self.status_var.set("Resumed")
+            self.status_var.set("▶️ Resumed")
     
     def stop_reading(self):
         """Stop the TTS reading process"""
         self.is_playing = False
         self.is_paused = False
+        self.stop_event.set()
         
         if self.current_process:
             self.current_process.terminate()
             self.current_process = None
+        
+        # Clear queues
+        while not self.generation_queue.empty():
+            try:
+                self.generation_queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        while not self.playback_queue.empty():
+            try:
+                self.playback_queue.get_nowait()
+            except queue.Empty:
+                break
         
         # Update button states
         self.start_btn.config(state="normal")
@@ -299,109 +647,19 @@ class TTSApplication:
         self.stop_btn.config(state="disabled")
         
         self.progress_var.set(0)
-        self.status_var.set("Stopped")
+        self.status_var.set("⏹️ Stopped")
     
-    def run_tts(self):
-        """Main TTS processing method (runs in separate thread)"""
-        try:
-            batch_size = 4
-            batches = [self.chunks[i:i + batch_size] for i in range(0, len(self.chunks), batch_size)]
-            
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                for batch_num, batch_chunks in enumerate(batches):
-                    if not self.is_playing:
-                        break
-                    
-                    self.current_batch = batch_num
-                    self.root.after(0, self.update_progress)
-                    
-                    # Generate audio for current batch
-                    self.root.after(0, lambda: self.status_var.set(f"Generating batch {batch_num + 1}/{len(batches)}"))
-                    
-                    futures = []
-                    batch_filenames = []
-                    
-                    for i, chunk in enumerate(batch_chunks):
-                        chunk_index = batch_num * batch_size + i
-                        filename = os.path.join(self.batch_dir, f"chunk_{chunk_index}.wav")
-                        future = executor.submit(self.generate_audio, chunk, filename)
-                        futures.append(future)
-                        batch_filenames.append(filename)
-                    
-                    # Wait for all chunks to complete
-                    for future in futures:
-                        future.result()
-                    
-                    if not self.is_playing:
-                        break
-                    
-                    # Stitch audio files
-                    stitched_filename = os.path.join(self.batch_dir, f"batch_{batch_num}.wav")
-                    self.stitch_audio_files(batch_filenames, stitched_filename)
-                    self.current_batch_file = stitched_filename
-                    
-                    # Play audio
-                    self.root.after(0, lambda: self.status_var.set(f"Playing batch {batch_num + 1}/{len(batches)}"))
-                    self.current_process = subprocess.Popen(['afplay', stitched_filename])
-                    
-                    # Wait for playback to finish
-                    while self.current_process and self.current_process.poll() is None:
-                        if not self.is_playing:
-                            self.current_process.terminate()
-                            break
-                        time.sleep(0.1)
-                    
-                    # Clean up files
-                    self.cleanup_files([stitched_filename] + batch_filenames)
-            
-            if self.is_playing:
-                self.root.after(0, self.reading_completed)
-                
-        except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("TTS Error", f"An error occurred: {str(e)}"))
-            self.root.after(0, self.stop_reading)
-    
-    def generate_audio(self, chunk, filename):
-        """Generate audio for a text chunk"""
-        audio_segments = list(self.kokoro(chunk, voice=self.voice_var.get(), speed=self.speed_var.get()))
-        full_audio = torch.cat([torch.tensor(audio) for _, _, audio in audio_segments])
-        samples = full_audio.numpy()
-        sf.write(filename, samples, 24000, format="WAV")
-        return filename
-    
-    def stitch_audio_files(self, filenames, output_filename, silence_ms=300):
-        """Stitch multiple audio files together with silence"""
-        all_audio = []
-        silence = np.zeros(int(silence_ms * 24000 / 1000), dtype=np.float32)
-        
-        for i, filename in enumerate(filenames):
-            if os.path.exists(filename):
-                audio, sr = sf.read(filename)
-                all_audio.append(audio)
-                if i < len(filenames) - 1:
-                    all_audio.append(silence)
-        
-        stitched_audio = np.concatenate(all_audio)
-        sf.write(output_filename, stitched_audio, 24000)
-    
-    def cleanup_files(self, filenames):
-        """Delete audio files to free up space"""
-        for filename in filenames:
-            if os.path.exists(filename):
-                os.remove(filename)
-    
-    def update_progress(self):
-        """Update progress bar and batch info"""
-        if self.total_batches > 0:
-            progress = (self.current_batch / self.total_batches) * 100
-            self.progress_var.set(progress)
-            self.batch_info_var.set(f"Batch {self.current_batch + 1} of {self.total_batches}")
+    def update_chunk_progress(self, chunk_progress):
+        """Update progress for individual chunk completion"""
+        # This method is no longer directly used in the new streaming system
+        pass
     
     def reading_completed(self):
         """Called when reading is completed"""
         self.stop_reading()
-        self.status_var.set("Reading completed")
-        messagebox.showinfo("Complete", "Reading completed successfully!")
+        self.status_var.set("🎉 Reading completed!")
+        self.batch_info_var.set("✅ All chunks completed successfully")
+        messagebox.showinfo("Complete", "🎉 Reading completed successfully!")
 
 def main():
     root = tk.Tk()

@@ -46,6 +46,4 @@ optimized_output.wav
 batches_and_chunks/
 
 # Test files
-benny.txt
-elegy.txt
-sample_text.txt
+test_texts/

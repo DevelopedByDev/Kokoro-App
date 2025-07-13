@@ -42,5 +42,9 @@ optimized_output.wav
 *.tmp
 *.temp 
 
+# Batches and chunks directory
+batches_and_chunks/
+
 # Test files
 benny.txt
+elegy.txt

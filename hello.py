@@ -8,6 +8,16 @@ import os
 import torch
 from concurrent.futures import ThreadPoolExecutor
 
+def setup_batches_chunks_directory():
+    """Create the batches_and_chunks directory if it doesn't exist"""
+    batch_dir = "batches_and_chunks"
+    if not os.path.exists(batch_dir):
+        os.makedirs(batch_dir)
+        print(f"📁 Created directory: {batch_dir}")
+    else:
+        print(f"📁 Using existing directory: {batch_dir}")
+    return batch_dir
+
 def split_text(text, max_sentences=2):
     sentences = text.split('. ')
     chunks = []
@@ -21,7 +31,7 @@ def split_text(text, max_sentences=2):
 def generate_audio(kokoro, chunk, filename):
     """Generate audio for a chunk and save to file"""
     print(f"🔄 Generating: {chunk[:50]}...")
-    audio_segments = list(kokoro(chunk, voice="am_adam", speed=1.2))
+    audio_segments = list(kokoro(chunk, voice="am_echo", speed=1.1))
     
     # Concatenate all audio segments 
     full_audio = torch.cat([torch.tensor(audio) for _, _, audio in audio_segments])
@@ -72,9 +82,12 @@ def cleanup_files(filenames):
             os.remove(filename)
             print(f"🗑️ Deleted: {filename}")
 
+# Setup batches and chunks directory
+batch_dir = setup_batches_chunks_directory()
+
 kokoro = KPipeline('a')  # 'a' for American English
 
-with open("benny.txt", "r") as file:
+with open("elegy.txt", "r") as file:
     text = file.read()
 
 chunks = split_text(text)
@@ -98,7 +111,7 @@ with ThreadPoolExecutor(max_workers=4) as executor:
         
         for i, chunk in enumerate(batch_chunks):
             chunk_index = batch_num * batch_size + i
-            filename = f"chunk_{chunk_index}.wav"
+            filename = os.path.join(batch_dir, f"chunk_{chunk_index}.wav")
             future = executor.submit(generate_audio, kokoro, chunk, filename)
             futures.append(future)
             batch_filenames.append(filename)
@@ -110,7 +123,7 @@ with ThreadPoolExecutor(max_workers=4) as executor:
         print(f"✅ Batch {batch_num + 1} generation completed!")
         
         # Create stitched audio filename
-        stitched_filename = f"batch_{batch_num}.wav"
+        stitched_filename = os.path.join(batch_dir, f"batch_{batch_num}.wav")
         
         # Stitch audio files together with 300ms silence
         stitch_audio_files(batch_filenames, stitched_filename, silence_ms=300)
@@ -122,8 +135,8 @@ with ThreadPoolExecutor(max_workers=4) as executor:
             
             # Clean up previous batch files
             if batch_num > 0:
-                prev_stitched = f"batch_{batch_num - 1}.wav"
-                prev_chunk_files = [f"chunk_{(batch_num - 1) * batch_size + j}.wav" 
+                prev_stitched = os.path.join(batch_dir, f"batch_{batch_num - 1}.wav")
+                prev_chunk_files = [os.path.join(batch_dir, f"chunk_{(batch_num - 1) * batch_size + j}.wav") 
                                   for j in range(min(batch_size, len(batches[batch_num - 1])))]
                 cleanup_files([prev_stitched] + prev_chunk_files)
         
@@ -138,8 +151,8 @@ with ThreadPoolExecutor(max_workers=4) as executor:
         
         # Clean up final batch files
         final_batch_num = len(batches) - 1
-        final_stitched = f"batch_{final_batch_num}.wav"
-        final_chunk_files = [f"chunk_{final_batch_num * batch_size + j}.wav" 
+        final_stitched = os.path.join(batch_dir, f"batch_{final_batch_num}.wav")
+        final_chunk_files = [os.path.join(batch_dir, f"chunk_{final_batch_num * batch_size + j}.wav") 
                            for j in range(len(batches[final_batch_num]))]
         cleanup_files([final_stitched] + final_chunk_files)
 

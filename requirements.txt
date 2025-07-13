@@ -1,7 +1,12 @@
 kokoro>=0.9.4
 soundfile
-ipython
 jupyter
 coremltools
 onnx
-onnxsim 
+pynput
+pyperclip
+# New dependencies for GUI
+PyPDF2
+ebooklib
+beautifulsoup4
+tkinter-tooltip 

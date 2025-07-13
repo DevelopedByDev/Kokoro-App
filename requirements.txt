@@ -10,4 +10,5 @@ psutil
 PyPDF2
 ebooklib
 beautifulsoup4
-tkinter-tooltip 
+tkinter-tooltip
+pyaudio 

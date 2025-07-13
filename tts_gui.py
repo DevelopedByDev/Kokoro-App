@@ -17,6 +17,8 @@ from threading import Event
 import queue
 from collections import deque
 import tempfile
+import pyaudio
+import wave
 
 # File format imports
 import PyPDF2
@@ -44,23 +46,29 @@ class TTSApplication:
         self.total_chunks = 0
         self.is_playing = False
         self.is_paused = False
-        self.current_process = None
         self.tts_thread = None
         self.kokoro = None
         self.batch_dir = "batches_and_chunks"
         
-        # Streaming audio system
-        self.audio_buffer = deque(maxlen=20)  # Buffer for generated audio files
-        self.playback_queue = queue.Queue()
+        # Continuous audio streaming system
+        self.audio_stream_queue = queue.Queue(maxsize=50)  # Audio data queue
         self.generation_queue = queue.Queue()
         self.stop_event = Event()
-        self.playback_thread = None
+        self.pause_event = Event()
         self.generation_workers = []
+        self.audio_stream = None
+        self.pyaudio_instance = None
+        self.stream_thread = None
+        
+        # Audio parameters
+        self.sample_rate = 24000
+        self.chunk_size = 1024
+        self.channels = 1
+        self.format = pyaudio.paFloat32
         
         # Buffer management
-        self.buffer_size = 8  # Number of chunks to keep in buffer
-        self.min_buffer_size = 3  # Minimum chunks before starting playback
-        self.generation_ahead = 12  # Generate this many chunks ahead
+        self.generation_ahead = 15  # Generate this many chunks ahead
+        self.played_chunks = 0
         
         # Initialize status variable first
         self.status_var = tk.StringVar(value="🚀 Initializing...")
@@ -77,6 +85,9 @@ class TTSApplication:
         
         # Setup batch directory
         self.setup_batches_directory()
+        
+        # Initialize PyAudio
+        self.setup_audio_system()
         
         # Start streaming workers
         self.start_streaming_workers()
@@ -143,6 +154,15 @@ class TTSApplication:
         # Configure root window
         self.root.configure(bg=self.colors['bg'])
         
+    def setup_audio_system(self):
+        """Initialize PyAudio for continuous audio streaming"""
+        try:
+            self.pyaudio_instance = pyaudio.PyAudio()
+            print("🎵 PyAudio initialized successfully")
+        except Exception as e:
+            print(f"❌ PyAudio initialization failed: {e}")
+            self.pyaudio_instance = None
+            
     def start_streaming_workers(self):
         """Start streaming audio generation and playback workers"""
         # Start generation workers
@@ -151,9 +171,9 @@ class TTSApplication:
             worker.start()
             self.generation_workers.append(worker)
             
-        # Start playback manager
-        self.playback_thread = threading.Thread(target=self.streaming_playback_manager, daemon=True)
-        self.playback_thread.start()
+        # Start continuous audio stream thread
+        self.stream_thread = threading.Thread(target=self.continuous_audio_stream, daemon=True)
+        self.stream_thread.start()
         
     def streaming_generation_worker(self):
         """Worker thread for continuous audio generation"""
@@ -164,9 +184,6 @@ class TTSApplication:
                     break
                     
                 chunk_index, chunk_text = task
-                
-                # Generate unique filename
-                filename = os.path.join(self.batch_dir, f"stream_chunk_{chunk_index}_{int(time.time() * 1000)}.wav")
                 
                 # Generate audio with device optimization
                 with torch.no_grad():
@@ -186,11 +203,13 @@ class TTSApplication:
                             full_audio = torch.cat([audio.detach().clone() for _, _, audio in audio_segments])
                             samples = full_audio.numpy()
                             
-                        # Save audio file
-                        sf.write(filename, samples, 24000, format="WAV")
+                        # Ensure samples are float32 and normalized
+                        samples = samples.astype(np.float32)
+                        if len(samples.shape) > 1:
+                            samples = samples.flatten()
                         
-                        # Add to playback queue
-                        self.playback_queue.put((chunk_index, filename))
+                        # Add to audio stream queue
+                        self.audio_stream_queue.put((chunk_index, samples))
                         
                         # Update progress
                         progress = (chunk_index + 1) / self.total_chunks * 100
@@ -206,78 +225,94 @@ class TTSApplication:
             except Exception as e:
                 print(f"❌ Generation worker error: {e}")
                 
-    def streaming_playback_manager(self):
-        """Manager for continuous audio playback"""
-        playback_buffer = {}  # chunk_index -> filename
-        next_chunk_to_play = 0
-        current_playback_process = None
-        
-        while not self.stop_event.is_set():
-            try:
-                # Get generated audio files
-                try:
-                    chunk_index, filename = self.playback_queue.get(timeout=0.1)
-                    playback_buffer[chunk_index] = filename
-                except queue.Empty:
-                    pass
-                
-                # Check if we can start/continue playback
-                if (self.is_playing and not self.is_paused and 
-                    next_chunk_to_play in playback_buffer and
-                    (current_playback_process is None or current_playback_process.poll() is not None)):
-                    
-                    # Start playing next chunk
-                    filename = playback_buffer[next_chunk_to_play]
-                    
-                    # Update status
-                    self.root.after(0, lambda idx=next_chunk_to_play: 
-                                   self.status_var.set(f"🎵 Playing chunk {idx + 1}/{self.total_chunks}"))
-                    
-                    # Start playback
-                    current_playback_process = subprocess.Popen(['afplay', filename])
-                    
-                    # Clean up old file and move to next
-                    if next_chunk_to_play > 0:
-                        old_filename = playback_buffer.get(next_chunk_to_play - 1)
-                        if old_filename and os.path.exists(old_filename):
-                            try:
-                                os.remove(old_filename)
-                            except:
-                                pass
-                    
-                    del playback_buffer[next_chunk_to_play]
-                    next_chunk_to_play += 1
-                    
-                    # Check if we've finished all chunks
-                    if next_chunk_to_play >= self.total_chunks:
-                        # Wait for last chunk to finish
-                        if current_playback_process:
-                            current_playback_process.wait()
-                        self.root.after(0, self.reading_completed)
-                        break
-                
-                # Handle pause/stop
-                if not self.is_playing and current_playback_process and current_playback_process.poll() is None:
-                    current_playback_process.terminate()
-                    current_playback_process = None
-                    
-                time.sleep(0.05)  # Small delay to prevent excessive CPU usage
-                
-            except Exception as e:
-                print(f"❌ Playback manager error: {e}")
-                time.sleep(0.1)
-                
-        # Cleanup on exit
-        if current_playback_process and current_playback_process.poll() is None:
-            current_playback_process.terminate()
+    def continuous_audio_stream(self):
+        """Continuous audio streaming thread using PyAudio"""
+        if not self.pyaudio_instance:
+            print("❌ PyAudio not available, falling back to file-based playback")
+            return
             
-        # Clean up remaining files
-        for filename in playback_buffer.values():
-            if os.path.exists(filename):
+        audio_buffer = {}  # chunk_index -> audio_data
+        next_chunk_to_play = 0
+        
+        # Create audio stream
+        try:
+            stream = self.pyaudio_instance.open(
+                format=self.format,
+                channels=self.channels,
+                rate=self.sample_rate,
+                output=True,
+                frames_per_buffer=self.chunk_size
+            )
+            
+            print("🎵 Continuous audio stream started")
+            
+            while not self.stop_event.is_set():
                 try:
-                    os.remove(filename)
-                except:
-                    pass
+                    # Get generated audio chunks
+                    try:
+                        chunk_index, audio_data = self.audio_stream_queue.get(timeout=0.1)
+                        audio_buffer[chunk_index] = audio_data
+                    except queue.Empty:
+                        pass
+                    
+                    # Play audio if ready and not paused
+                    if (self.is_playing and not self.is_paused and 
+                        next_chunk_to_play in audio_buffer):
+                        
+                        audio_data = audio_buffer[next_chunk_to_play]
+                        
+                        # Update status
+                        self.root.after(0, lambda idx=next_chunk_to_play: 
+                                       self.status_var.set(f"🎵 Playing chunk {idx + 1}/{self.total_chunks}"))
+                        
+                        # Stream audio data in small chunks for smooth playback
+                        for i in range(0, len(audio_data), self.chunk_size):
+                            if self.stop_event.is_set() or not self.is_playing:
+                                break
+                                
+                            # Wait if paused
+                            while self.is_paused and not self.stop_event.is_set():
+                                time.sleep(0.01)
+                                
+                            if self.stop_event.is_set() or not self.is_playing:
+                                break
+                                
+                            chunk = audio_data[i:i + self.chunk_size]
+                            if len(chunk) < self.chunk_size:
+                                # Pad with zeros if needed
+                                chunk = np.pad(chunk, (0, self.chunk_size - len(chunk)), mode='constant')
+                            
+                            # Write to audio stream
+                            stream.write(chunk.astype(np.float32).tobytes())
+                        
+                        # Clean up and move to next chunk
+                        del audio_buffer[next_chunk_to_play]
+                        next_chunk_to_play += 1
+                        self.played_chunks = next_chunk_to_play
+                        
+                        # Check if we've finished all chunks
+                        if next_chunk_to_play >= self.total_chunks:
+                            self.root.after(0, self.reading_completed)
+                            break
+                    
+                    # Small delay to prevent excessive CPU usage
+                    time.sleep(0.001)
+                    
+                except Exception as e:
+                    print(f"❌ Audio streaming error: {e}")
+                    time.sleep(0.1)
+                    
+        except Exception as e:
+            print(f"❌ Failed to create audio stream: {e}")
+            
+        finally:
+            # Cleanup
+            try:
+                if 'stream' in locals():
+                    stream.stop_stream()
+                    stream.close()
+            except:
+                pass
     
     def setup_tts(self):
         """Initialize the Kokoro TTS pipeline"""
@@ -561,9 +596,9 @@ class TTSApplication:
             except queue.Empty:
                 break
         
-        while not self.playback_queue.empty():
+        while not self.audio_stream_queue.empty():
             try:
-                self.playback_queue.get_nowait()
+                self.audio_stream_queue.get_nowait()
             except queue.Empty:
                 break
         
@@ -623,10 +658,6 @@ class TTSApplication:
         self.is_paused = False
         self.stop_event.set()
         
-        if self.current_process:
-            self.current_process.terminate()
-            self.current_process = None
-        
         # Clear queues
         while not self.generation_queue.empty():
             try:
@@ -634,9 +665,9 @@ class TTSApplication:
             except queue.Empty:
                 break
         
-        while not self.playback_queue.empty():
+        while not self.audio_stream_queue.empty():
             try:
-                self.playback_queue.get_nowait()
+                self.audio_stream_queue.get_nowait()
             except queue.Empty:
                 break
         
@@ -660,11 +691,33 @@ class TTSApplication:
         self.status_var.set("🎉 Reading completed!")
         self.batch_info_var.set("✅ All chunks completed successfully")
         messagebox.showinfo("Complete", "🎉 Reading completed successfully!")
+        
+    def cleanup_audio_system(self):
+        """Cleanup PyAudio resources"""
+        try:
+            if self.pyaudio_instance:
+                self.pyaudio_instance.terminate()
+                self.pyaudio_instance = None
+                print("🎵 PyAudio terminated successfully")
+        except Exception as e:
+            print(f"⚠️ PyAudio cleanup error: {e}")
 
 def main():
     root = tk.Tk()
     app = TTSApplication(root)
-    root.mainloop()
+    
+    # Handle window close event
+    def on_closing():
+        app.stop_reading()
+        app.cleanup_audio_system()
+        root.destroy()
+    
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        on_closing()
 
 if __name__ == "__main__":
     main() 

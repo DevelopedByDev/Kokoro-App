@@ -31,7 +31,7 @@ def split_text(text, max_sentences=2):
 def generate_audio(kokoro, chunk, filename):
     """Generate audio for a chunk and save to file"""
     print(f"🔄 Generating: {chunk[:50]}...")
-    audio_segments = list(kokoro(chunk, voice="am_echo", speed=1.0))
+    audio_segments = list(kokoro(chunk, voice="af_echo", speed=1.0))
     
     # Concatenate all audio segments 
     full_audio = torch.cat([torch.tensor(audio) for _, _, audio in audio_segments])
@@ -87,7 +87,7 @@ batch_dir = setup_batches_chunks_directory()
 
 kokoro = KPipeline('a')  # 'a' for American English
 
-with open("elegy.txt", "r") as file:
+with open("test_texts/Accelerando.txt", "r") as file:
     text = file.read()
 
 chunks = split_text(text)
